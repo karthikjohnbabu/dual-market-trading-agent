@@ -1,0 +1,1 @@
+﻿# Placeholder: eToro broker client

@@ -1,0 +1,1 @@
+﻿# Placeholder: signal indicators

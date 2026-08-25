@@ -1,11 +1,9 @@
 {
   "mcpServers": {
     "zerodha-trading": {
-      "type": "stdio",
-      "command": "C:\\Users\\karth\\AppData\\Local\\Programs\\Python\\Python312\\python.exe",
-      "args": ["${workspaceFolder}/mcp_servers/zerodha_mcp.py"],
-      "cwd": "${workspaceFolder}",
-      "envFile": "${workspaceFolder}/.env"
+      "command": "python",
+      "args": ["mcp_servers/zerodha_mcp.py"],
+      "cwd": "${workspaceFolder}"
     }
   }
 }

@@ -1,1 +1,32 @@
-﻿# Placeholder: Python dependencies
+﻿# Core data
+pandas>=2.0.0
+numpy>=1.24.0
+requests>=2.31.0
+
+# Technical indicators
+ta>=0.11.0
+pandas-ta>=0.3.14b
+
+# Brokers
+kiteconnect>=4.2.0
+
+# Backtesting
+vectorbt>=0.26.1
+
+# Environment & config
+python-dotenv>=1.0.0
+pyyaml>=6.0
+
+# Scheduling (for running strategies on a timer)
+schedule>=1.2.0
+
+# Logging
+loguru>=0.7.0
+
+# Testing
+pytest>=7.4.0
+pytest-cov>=4.1.0
+
+# Utilities
+httpx>=0.24.0
+python-dateutil>=2.8.2

@@ -1,1 +1,36 @@
-﻿# Placeholder: application settings
+﻿trading:
+  mode: paper              # Options: paper | live
+  max_drawdown_pct: 15     # Flag as HIGH RISK if exceeded
+  risk_per_trade_pct: 1    # Max % of capital per trade
+  capital_inr: 100000      # Starting capital for India (INR)
+  capital_gbp: 5000        # Starting capital for UK (GBP)
+
+india:
+  broker: zerodha
+  exchange: NSE
+  symbols:
+    - RELIANCE
+    - INFY
+    - TCS
+    - HDFCBANK
+  timeframe: day
+
+uk:
+  broker: etoro
+  symbols:
+    - TSLA
+    - AAPL
+    - AMZN
+  timeframe: day
+
+momentum:
+  ema_fast: 9
+  ema_slow: 21
+  rsi_period: 14
+  rsi_overbought: 70
+  rsi_oversold: 30
+  volume_factor: 1.5       # Volume must be 1.5x average to confirm signal
+
+logging:
+  level: INFO
+  file: logs/trading.log

@@ -39,6 +39,8 @@ class ZerodhaClient:
         self.api_key = os.getenv("ZERODHA_API_KEY", "").strip()
         self.api_secret = os.getenv("ZERODHA_API_SECRET", "").strip()
         self.access_token = os.getenv("ZERODHA_ACCESS_TOKEN", "").strip()
+        self.config = load_config()
+        mode = str(self.config.get("trading", {}).get("mode", "paper")).lower()
 
         missing = [
             name
@@ -49,18 +51,21 @@ class ZerodhaClient:
             )
             if not value
         ]
-        if missing:
+        if missing and mode == "live":
             raise ValueError(
                 "Missing Zerodha credentials in .env: " + ", ".join(missing)
             )
+        if missing:
+            logger.warning(
+                "Zerodha credentials missing ({}) — paper/simulation only",
+                ", ".join(missing),
+            )
+            self.kite = None  # type: ignore[assignment]
+        else:
+            self.kite = KiteConnect(api_key=self.api_key)
+            self.kite.set_access_token(self.access_token)
 
-        self.config = load_config()
-        self.kite = KiteConnect(api_key=self.api_key)
-        self.kite.set_access_token(self.access_token)
-        logger.info(
-            "ZerodhaClient connected (mode={})",
-            self._trading_mode(),
-        )
+        logger.info("ZerodhaClient connected (mode={})", self._trading_mode())
 
     def _trading_mode(self) -> str:
         """Return the configured trading mode (``paper`` or ``live``)."""
@@ -75,6 +80,8 @@ class ZerodhaClient:
             Returns an empty list on failure.
         """
         try:
+            if self.kite is None:
+                return []
             payload = self.kite.positions()
             positions = list(payload.get("net", []))
             logger.debug("Fetched {} Zerodha net positions", len(positions))
@@ -91,6 +98,8 @@ class ZerodhaClient:
             Returns an empty list on failure.
         """
         try:
+            if self.kite is None:
+                return []
             holdings = list(self.kite.holdings())
             logger.debug("Fetched {} Zerodha holdings", len(holdings))
             return holdings
@@ -98,12 +107,23 @@ class ZerodhaClient:
             logger.exception("Failed to fetch Zerodha portfolio/holdings: {}", exc)
             return []
 
+    def _resolve_product(self, product: str | None) -> str:
+        """Map a product label to a Kite product constant (CNC or MIS)."""
+        label = (product or self.config.get("day_trading", {}).get("product") or "CNC")
+        label = str(label).strip().upper()
+        if label == "MIS":
+            return self.kite.PRODUCT_MIS
+        if label == "CNC":
+            return self.kite.PRODUCT_CNC
+        raise ValueError(f"Unsupported product: {product} (use MIS or CNC)")
+
     def place_order(
         self,
         symbol: str,
         transaction_type: str,
         quantity: int,
         order_type: str = "MARKET",
+        product: str | None = None,
     ) -> str:
         """Place an NSE equity order, or simulate it in paper mode.
 
@@ -112,6 +132,8 @@ class ZerodhaClient:
             transaction_type: ``BUY`` or ``SELL``.
             quantity: Number of shares (must be > 0).
             order_type: Order type string (default ``MARKET``).
+            product: ``MIS`` (intraday) or ``CNC`` (delivery). Defaults to
+                ``day_trading.product`` from config, else ``CNC``.
 
         Returns:
             Zerodha ``order_id`` in live mode, or ``PAPER_ORDER_SIMULATED``
@@ -129,18 +151,29 @@ class ZerodhaClient:
             raise ValueError("transaction_type must be 'BUY' or 'SELL'")
 
         order_type_norm = order_type.strip().upper()
+        product_label = (
+            product
+            or self.config.get("day_trading", {}).get("product")
+            or "CNC"
+        )
+        product_label = str(product_label).strip().upper()
         mode = self._trading_mode()
 
         if mode != "live":
             logger.info(
-                "PAPER order (not sent): symbol={} side={} qty={} type={} mode={}",
+                "PAPER order (not sent): symbol={} side={} qty={} type={} "
+                "product={} mode={}",
                 symbol.upper(),
                 txn,
                 quantity,
                 order_type_norm,
+                product_label,
                 mode,
             )
             return "PAPER_ORDER_SIMULATED"
+
+        if self.kite is None:
+            raise RuntimeError("Kite client not initialised — cannot place live orders")
 
         kite_order_type = {
             "MARKET": self.kite.ORDER_TYPE_MARKET,
@@ -149,6 +182,7 @@ class ZerodhaClient:
         if kite_order_type is None:
             raise ValueError(f"Unsupported order_type: {order_type}")
 
+        kite_product = self._resolve_product(product_label)
         order_id = self.kite.place_order(
             variety=self.kite.VARIETY_REGULAR,
             exchange=self.kite.EXCHANGE_NSE,
@@ -156,17 +190,69 @@ class ZerodhaClient:
             transaction_type=txn,
             quantity=int(quantity),
             order_type=kite_order_type,
-            product=self.kite.PRODUCT_CNC,
+            product=kite_product,
         )
         logger.info(
-            "LIVE order placed: order_id={} symbol={} side={} qty={} type={}",
+            "LIVE order placed: order_id={} symbol={} side={} qty={} "
+            "type={} product={}",
             order_id,
             symbol.upper(),
             txn,
             quantity,
             order_type_norm,
+            product_label,
         )
         return str(order_id)
+
+    def square_off_mis_positions(self) -> list[dict[str, Any]]:
+        """Market-sell all open MIS (intraday) net positions.
+
+        Returns:
+            List of result dicts per symbol (``symbol``, ``quantity``, ``order_id``).
+        """
+        results: list[dict[str, Any]] = []
+        for pos in self.get_positions():
+            product = str(pos.get("product", "")).upper()
+            qty = int(float(pos.get("quantity", 0) or 0))
+            symbol = str(pos.get("tradingsymbol", "")).upper()
+            if product != "MIS" or qty == 0 or not symbol:
+                continue
+            side = "SELL" if qty > 0 else "BUY"
+            abs_qty = abs(qty)
+            try:
+                order_id = self.place_order(
+                    symbol=symbol,
+                    transaction_type=side,
+                    quantity=abs_qty,
+                    product="MIS",
+                )
+                results.append(
+                    {
+                        "symbol": symbol,
+                        "quantity": abs_qty,
+                        "side": side,
+                        "order_id": order_id,
+                    }
+                )
+                logger.info(
+                    "Squared off MIS {}: {} qty={} order_id={}",
+                    symbol,
+                    side,
+                    abs_qty,
+                    order_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Square-off failed for {}: {}", symbol, exc)
+                results.append(
+                    {
+                        "symbol": symbol,
+                        "quantity": abs_qty,
+                        "side": side,
+                        "order_id": None,
+                        "error": str(exc),
+                    }
+                )
+        return results
 
     def cancel_order(self, order_id: str) -> bool:
         """Cancel a live order. No-op in paper mode.
@@ -185,6 +271,10 @@ class ZerodhaClient:
                 mode,
             )
             return True
+
+        if self.kite is None:
+            logger.error("Cannot cancel — Kite client not initialised")
+            return False
 
         try:
             self.kite.cancel_order(

@@ -26,6 +26,12 @@ You are a senior quantitative trading engineer working on a dual-market algorith
 ## Markets
 - India: NSE/BSE equities via Zerodha
 - UK: eToro portfolio monitoring (read-only), signals generated locally
+- Day trading (MIS): auto buy/sell with same-day square-off via `python main.py --mode daytrade`
+
+## Risk (always enforce)
+- Use `risk/manager.py` gates: max positions, daily loss halt, SL/TP, kill switch file
+- Journal fills to `logs/trades.jsonl`
+- Run `python main.py --mode health` before live
 
 ## Code style
 - Type hints on all functions

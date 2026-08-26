@@ -19,7 +19,9 @@ from loguru import logger
 
 from brokers.zerodha import ZerodhaClient
 from data.fetch import fetch_india_data, load_config
+from execution.trade_journal import TradeJournal
 from indicators.signals import generate_momentum_signals
+from risk.manager import RiskManager
 
 
 class OrderManager:
@@ -30,12 +32,29 @@ class OrderManager:
         self.config = config
         self.client = ZerodhaClient()
         self.client.config = self.config  # CLI may override mode
+        self.risk = RiskManager(config)
+        self.journal = TradeJournal(config)
+        self._default_product = "CNC"
+        self._paper_positions: dict[str, int] = {}
         mode = str(self.config.get("trading", {}).get("mode", "paper")).lower()
         logger.info("OrderManager ready (mode={})", mode)
+
+    def set_default_product(self, product: str) -> None:
+        """Set default broker product for subsequent orders (``MIS`` or ``CNC``)."""
+        self._default_product = product.strip().upper()
+        logger.info("Default product set to {}", self._default_product)
+
+    def sleep(self, seconds: int) -> None:
+        """Sleep helper used by day/swing loops."""
+        time.sleep(seconds)
 
     def _risk_per_trade_pct(self) -> float:
         """Return max percent of capital allowed per trade."""
         return float(self.config.get("trading", {}).get("risk_per_trade_pct", 1))
+
+    def _trading_mode(self) -> str:
+        """Return paper/live mode from config."""
+        return str(self.config.get("trading", {}).get("mode", "paper")).lower()
 
     def validate_order(
         self,
@@ -77,13 +96,51 @@ class OrderManager:
         return {"valid": True, "reason": "OK", "order_value": order_value}
 
     def _position_quantity(self, symbol: str) -> int:
-        """Return net open quantity for ``symbol`` from Zerodha positions."""
+        """Return net open quantity for ``symbol`` (paper book or Zerodha)."""
         symbol_u = symbol.upper()
+        if self._trading_mode() != "live":
+            return int(self._paper_positions.get(symbol_u, 0))
+
         total = 0
         for pos in self.client.get_positions():
             if str(pos.get("tradingsymbol", "")).upper() == symbol_u:
                 total += int(float(pos.get("quantity", 0) or 0))
         return total
+
+    def square_off_paper_positions(self) -> list[dict[str, Any]]:
+        """Close all tracked paper positions (day-trade square-off)."""
+        results: list[dict[str, Any]] = []
+        for symbol, qty in list(self._paper_positions.items()):
+            if qty == 0:
+                continue
+            side = "SELL" if qty > 0 else "BUY"
+            abs_qty = abs(qty)
+            order_id = self.client.place_order(
+                symbol=symbol,
+                transaction_type=side,
+                quantity=abs_qty,
+                product=self._default_product,
+            )
+            self._paper_positions[symbol] = 0
+            self.risk.register_exit(symbol, 0.0)
+            results.append(
+                {
+                    "symbol": symbol,
+                    "quantity": abs_qty,
+                    "side": side,
+                    "order_id": order_id,
+                }
+            )
+            self.journal.record(
+                {
+                    "action": "SQUARE_OFF",
+                    "symbol": symbol,
+                    "quantity": abs_qty,
+                    "order_id": order_id,
+                }
+            )
+            logger.info("PAPER square-off {}: {} qty={}", symbol, side, abs_qty)
+        return results
 
     def execute_signal(
         self,
@@ -99,6 +156,7 @@ class OrderManager:
         """
         signal_u = signal.strip().upper()
         symbol_u = symbol.upper()
+        product = self._default_product
 
         if signal_u == "HOLD":
             logger.info("{}: HOLD — no trade", symbol_u)
@@ -111,6 +169,31 @@ class OrderManager:
             }
 
         if signal_u == "BUY":
+            if self._position_quantity(symbol_u) > 0:
+                return {
+                    "action": "BUY_SKIPPED",
+                    "order_id": None,
+                    "quantity": 0,
+                    "value": 0.0,
+                    "reason": f"{symbol_u}: already in position",
+                }
+            gate = self.risk.allow_new_entry(symbol_u)
+            if not gate["allowed"]:
+                logger.warning("BUY risk-blocked for {}: {}", symbol_u, gate["reason"])
+                self.journal.record(
+                    {
+                        "action": "BUY_BLOCKED",
+                        "symbol": symbol_u,
+                        "reason": gate["reason"],
+                    }
+                )
+                return {
+                    "action": "BUY_BLOCKED",
+                    "order_id": None,
+                    "quantity": 0,
+                    "value": 0.0,
+                    "reason": gate["reason"],
+                }
             risk_pct = self._risk_per_trade_pct()
             notional = float(capital) * (risk_pct / 100.0)
             quantity = int(notional // float(current_price)) if current_price > 0 else 0
@@ -124,14 +207,23 @@ class OrderManager:
                     "value": check["order_value"],
                     "reason": check["reason"],
                 }
-            order_id = self.client.place_order(symbol_u, "BUY", quantity)
+            order_id = self.client.place_order(
+                symbol_u, "BUY", quantity, product=product
+            )
+            if self._trading_mode() != "live":
+                self._paper_positions[symbol_u] = (
+                    self._paper_positions.get(symbol_u, 0) + quantity
+                )
+            self.risk.register_entry(symbol_u, quantity, current_price)
             result = {
                 "action": "BUY",
                 "order_id": order_id,
                 "quantity": quantity,
                 "value": check["order_value"],
                 "reason": check["reason"],
+                "product": product,
             }
+            self.journal.record({"symbol": symbol_u, "price": current_price, **result})
             logger.info("BUY executed: {}", result)
             return result
 
@@ -148,14 +240,22 @@ class OrderManager:
                     "reason": reason,
                 }
             order_value = quantity * float(current_price)
-            order_id = self.client.place_order(symbol_u, "SELL", quantity)
+            order_id = self.client.place_order(
+                symbol_u, "SELL", quantity, product=product
+            )
+            if self._trading_mode() != "live":
+                self._paper_positions[symbol_u] = 0
+            pnl = self.risk.register_exit(symbol_u, current_price)
             result = {
                 "action": "SELL",
                 "order_id": order_id,
                 "quantity": quantity,
                 "value": order_value,
                 "reason": "Full position close",
+                "product": product,
+                "pnl": round(pnl, 2),
             }
+            self.journal.record({"symbol": symbol_u, "price": current_price, **result})
             logger.info("SELL executed: {}", result)
             return result
 

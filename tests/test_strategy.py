@@ -127,7 +127,47 @@ def test_paper_order_guard() -> None:
         symbol="RELIANCE",
         transaction_type="BUY",
         quantity=1,
+        product="MIS",
     )
 
     assert order_id == "PAPER_ORDER_SIMULATED"
     client.kite.place_order.assert_not_called()
+
+
+def test_day_trading_strategy_metadata() -> None:
+    """DayTradingStrategy exposes MIS product and intraday timeframe."""
+    from strategies.day_trading import DayTradingStrategy
+
+    cfg = _sample_config()
+    cfg["day_trading"] = {
+        "product": "MIS",
+        "timeframe": "5minute",
+        "square_off_time": "15:15",
+    }
+    strategy = DayTradingStrategy(cfg)
+    assert strategy.product() == "MIS"
+    assert strategy.timeframe() == "5minute"
+
+    df = _mock_ohlcv(50)
+    signaled = strategy.run(df)
+    summary = strategy.summary(signaled)
+    assert summary["style"] == "day_trading"
+    assert summary["product"] == "MIS"
+
+
+def test_mean_reversion_signals() -> None:
+    """Mean reversion emits only BUY/SELL/HOLD."""
+    from strategies.mean_reversion import MeanReversionStrategy
+
+    cfg = _sample_config()
+    cfg["mean_reversion"] = {
+        "rsi_period": 14,
+        "rsi_oversold": 30,
+        "rsi_overbought": 70,
+        "lookback": 20,
+        "entry_z": 2.0,
+    }
+    result = MeanReversionStrategy(cfg).run(_mock_ohlcv(80))
+    assert "signal" in result.columns
+    assert "zscore" in result.columns
+    assert set(result["signal"].dropna().unique()).issubset({"BUY", "SELL", "HOLD"})

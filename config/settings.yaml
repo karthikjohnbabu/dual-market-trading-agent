@@ -1,9 +1,18 @@
-﻿trading:
+﻿risk:
+  max_open_positions: 3          # Cap concurrent open symbols
+  daily_loss_limit_pct: 2        # Halt new entries if day PnL <= -2% of capital
+  stop_loss_pct: 1.0             # Exit long if price drops this % from entry
+  take_profit_pct: 2.0           # Exit long if price rises this % from entry
+  kill_switch_file: logs/KILL_SWITCH   # If file exists, block all new entries
+  require_paper_before_live: true
+
+trading:
   mode: paper              # Options: paper | live
   max_drawdown_pct: 15     # Flag as HIGH RISK if exceeded
   risk_per_trade_pct: 1    # Max % of capital per trade
   capital_inr: 100000      # Starting capital for India (INR)
   capital_gbp: 5000        # Starting capital for UK (GBP)
+  style: day_trading       # Options: swing | day_trading
 
 india:
   broker: zerodha
@@ -13,7 +22,7 @@ india:
     - INFY
     - TCS
     - HDFCBANK
-  timeframe: day
+  timeframe: day           # Used for swing / backtest
 
 uk:
   broker: etoro
@@ -23,6 +32,18 @@ uk:
     - AMZN
   timeframe: day
 
+# Intraday (MIS) day-trading — square off same day (Prasath Anna requirement)
+day_trading:
+  enabled: true
+  product: MIS             # Zerodha intraday product (not CNC)
+  timeframe: 5minute       # Kite interval: 5minute | 15minute | etc.
+  lookback_days: 5         # History window for intraday indicators
+  market_open: "09:15"     # IST
+  square_off_time: "15:15" # IST — force close all MIS positions
+  market_close: "15:30"    # IST
+  poll_seconds: 60         # Loop sleep between signal cycles
+  no_new_entries_after: "14:45"  # Stop opening new BUY after this (IST)
+
 momentum:
   ema_fast: 9
   ema_slow: 21
@@ -31,6 +52,14 @@ momentum:
   rsi_oversold: 30
   volume_factor: 1.5       # Volume must be 1.5x average to confirm signal
 
+mean_reversion:
+  rsi_period: 14
+  rsi_oversold: 30
+  rsi_overbought: 70
+  lookback: 20             # Bollinger mid / mean window
+  entry_z: 2.0             # Enter when price z-score beyond this
+
 logging:
   level: INFO
   file: logs/trading.log
+  trades_file: logs/trades.jsonl

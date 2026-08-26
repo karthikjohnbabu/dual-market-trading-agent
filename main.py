@@ -5,7 +5,10 @@ Usage::
     python main.py --mode backtest
     python main.py --mode paper
     python main.py --mode live
+    python main.py --mode daytrade
     python main.py --mode scan
+    python main.py --mode health
+    python main.py --mode status
 """
 
 from __future__ import annotations
@@ -26,8 +29,12 @@ from backtest.engine import (
     run_uk_backtests,
 )
 from data.fetch import fetch_india_data, fetch_uk_data, load_config
+from execution.day_trader import DayTrader
 from execution.order_manager import OrderManager
+from execution.trade_journal import TradeJournal
 from indicators.signals import generate_momentum_signals
+from ops.health import format_health_report, run_health_check
+from risk.manager import RiskManager
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -37,16 +44,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--mode",
-        choices=("backtest", "paper", "live", "scan"),
+        choices=(
+            "backtest",
+            "paper",
+            "live",
+            "daytrade",
+            "scan",
+            "health",
+            "status",
+        ),
         required=True,
-        help="backtest | paper | live | scan",
+        help="backtest | paper | live | daytrade | scan | health | status",
     )
     return parser.parse_args(argv)
 
 
 def run_backtest_mode(config: dict[str, Any]) -> None:
     """Run full India + UK backtests and print the summary table."""
-    logger.info("Mode=backtest â€” running engine for all configured symbols")
+    logger.info("Mode=backtest — running engine for all configured symbols")
     rows: list[dict[str, Any]] = []
     rows.extend(run_india_backtests(config))
     rows.extend(run_uk_backtests(config))
@@ -63,14 +78,15 @@ def run_order_mode(config: dict[str, Any], mode: str) -> None:
     """Run the order-manager loop in paper or live mode."""
     cfg = copy.deepcopy(config)
     cfg.setdefault("trading", {})["mode"] = mode
-    logger.info("Mode={} â€” starting OrderManager loop", mode)
+    logger.info("Mode={} — starting OrderManager loop", mode)
 
     if mode == "live":
-        logger.warning(
-            "LIVE MODE: real orders may be sent to Zerodha. "
-            "Paper trade first unless you explicitly intend live trading. "
-            "Ctrl+C to stop."
-        )
+        if cfg.get("risk", {}).get("require_paper_before_live", True):
+            logger.warning(
+                "LIVE MODE: real orders may be sent. "
+                "Confirm paper results first. Ctrl+C to stop."
+            )
+        logger.warning("LIVE MODE enabled — Ctrl+C to stop.")
 
     manager = OrderManager(cfg)
     try:
@@ -126,7 +142,7 @@ def _scan_one(
 
 def run_scan_mode(config: dict[str, Any]) -> None:
     """Scan all configured India and UK symbols; print BUY/SELL/HOLD."""
-    logger.info("Mode=scan â€” momentum signals for configured symbols")
+    logger.info("Mode=scan — momentum signals for configured symbols")
     rows: list[dict[str, Any]] = []
 
     for symbol in config.get("india", {}).get("symbols", []):
@@ -167,14 +183,65 @@ def run_scan_mode(config: dict[str, Any]) -> None:
     print(" | ".join(h.ljust(widths[h]) for h in headers))
     print("-+-".join("-" * widths[h] for h in headers))
     for row in rows:
-        print(
-            " | ".join(str(row.get(h, "")).ljust(widths[h]) for h in headers)
-        )
+        print(" | ".join(str(row.get(h, "")).ljust(widths[h]) for h in headers))
     print()
 
     buys = [r["symbol"] for r in rows if r.get("signal") == "BUY"]
     sells = [r["symbol"] for r in rows if r.get("signal") == "SELL"]
-    logger.info("Scan complete â€” BUY: {} | SELL: {}", buys or "none", sells or "none")
+    logger.info("Scan complete — BUY: {} | SELL: {}", buys or "none", sells or "none")
+
+
+def run_daytrade_mode(config: dict[str, Any]) -> None:
+    """Run intraday MIS day-trading with same-day square-off (paper by default)."""
+    cfg = copy.deepcopy(config)
+    cfg.setdefault("trading", {})["style"] = "day_trading"
+    if str(cfg.get("trading", {}).get("mode", "paper")).lower() == "live":
+        logger.warning(
+            "LIVE daytrade: real MIS orders + forced square-off. "
+            "Paper trade first unless you explicitly intend live."
+        )
+    else:
+        cfg.setdefault("trading", {})["mode"] = "paper"
+        logger.info("Daytrade running in PAPER mode (MIS simulated + square-off)")
+
+    trader = DayTrader(cfg)
+    try:
+        trader.run()
+    except KeyboardInterrupt:
+        logger.info("DayTrader stopped by user — attempting final square-off")
+        trader.square_off_all()
+
+
+def run_health_mode() -> None:
+    """Print readiness checks (config, kill switch, risk limits, creds)."""
+    report = run_health_check()
+    print(format_health_report(report))
+    if not report.get("overall_ok"):
+        sys.exit(1)
+
+
+def run_status_mode(config: dict[str, Any]) -> None:
+    """Print risk snapshot and recent journal events."""
+    risk = RiskManager(config)
+    journal = TradeJournal(config)
+    status = risk.status()
+    print("Risk status")
+    print("-" * 40)
+    for key, value in status.items():
+        print(f"{key}: {value}")
+    print()
+    print("Recent trades (journal)")
+    print("-" * 40)
+    recent = journal.recent(10)
+    if not recent:
+        print("(no trades logged yet)")
+    else:
+        for row in recent:
+            print(
+                f"{row.get('ts', '')} | {row.get('action')} | "
+                f"{row.get('symbol')} | qty={row.get('quantity')} | "
+                f"pnl={row.get('pnl', '-')}"
+            )
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -194,8 +261,14 @@ def main(argv: list[str] | None = None) -> None:
         run_order_mode(config, "paper")
     elif args.mode == "live":
         run_order_mode(config, "live")
+    elif args.mode == "daytrade":
+        run_daytrade_mode(config)
     elif args.mode == "scan":
         run_scan_mode(config)
+    elif args.mode == "health":
+        run_health_mode()
+    elif args.mode == "status":
+        run_status_mode(config)
     else:
         logger.error("Unknown mode: {}", args.mode)
         sys.exit(2)
